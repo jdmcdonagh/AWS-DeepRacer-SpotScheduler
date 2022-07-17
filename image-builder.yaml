@@ -358,8 +358,8 @@ Resources:
                   commands:
                     - |
                       id=$(curl http://169.254.169.254/latest/meta-data/instance-id)
-                      vol_id=$(aws ec2 describe-instances --region us-east-2 --instance-ids $id --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)
-                      aws ec2 modify-volume --size 40 --volume-id $vol_id --region us-east-2
+                      vol_id=$(aws ec2 describe-instances --region us-east-1 --instance-ids $id --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)
+                      aws ec2 modify-volume --size 40 --volume-id $vol_id --region us-east-1
   PullDeepracerDockerImagesComponent:
     Type: AWS::ImageBuilder::Component
     Properties:
