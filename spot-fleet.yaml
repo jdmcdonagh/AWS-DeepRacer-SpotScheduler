@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Setup a spot fleet for deep racer
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: g4dn.4xlarge
+  ResourcesStackName:
+    Type: String
+  RunName:
+    Type: String
+  StartMinutes:
+    Type: Number
+    Description: number of minutes to wait until starting
+    Default: 0
+    MinValue: 0
+    MaxValue: 1440 # 24 hours
+  EndMinutes:
+    Type: Number
+    Description: minutes after which training is stopped and this stack is deleted
+    Default: 120
+    MinValue: 10
+    MaxValue: 1440 # 24 hours
+  
+Outputs:
+
+  SpotFleet:
+    Value: !Ref SpotFleet
+
+  StartTime:
+    Description: The spot fleet start time
+    Value: !GetAtt GetDatetime.Start
+
+  EndTime:
+    Description: The spot fleet end time
+    Value: !GetAtt GetDatetime.End
+
+Resources:
+
+  SpotFleet:
+    Type: AWS::EC2::SpotFleet
+    Properties: 
+      SpotFleetRequestConfigData: 
+        IamFleetRole: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
+        AllocationStrategy: capacityOptimized
+        TargetCapacity: 1
+        ValidFrom: !GetAtt GetDatetime.Start
+        ValidUntil: !GetAtt GetDatetime.End
+        TerminateInstancesWithExpiration: true
+        Type: request
+        LaunchTemplateConfigs:
+          - LaunchTemplateSpecification:
+              LaunchTemplateId: !Ref LaunchTemplate
+              Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            1-append-fstab:
+              command: "bash -c 'cat /tmp/fstabcontent.txt >> /etc/fstab'"
+
+            2-mount-fstab:
+              command: "bash -c 'mount /home/ubuntu/efs'"
+
+            3-start-train:
+              command: "su -l ubuntu bash -c '/home/ubuntu/bin/start_training.sh'"
+
+          files:
+            /tmp/fstabcontent.txt:
+              content:
+                Fn::Sub:
+                - "${EFS} /home/ubuntu/efs efs _netdev,tls,accesspoint=${EFSAP} 0 0"
+                - EFS:
+                       Fn::ImportValue:
+                           !Sub "${ResourcesStackName}-EFS"
+                  EFSAP:
+                       Fn::ImportValue:
+                           !Sub "${ResourcesStackName}-EFSAccessPoint"
+              mode : "000755"
+              owner: root
+            /etc/profile.d/my_efs.sh:
+              content:
+                Fn::Sub:
+                - "export MY_EFS=${EFS}"
+                - EFS:
+                        Fn::ImportValue:
+                            !Sub "${ResourcesStackName}-EFS"
+              mode : "000755"
+              owner: root
+              group: root
+            /etc/profile.d/my_bucket.sh:
+              content:
+                Fn::Sub:
+                - "export MY_BUCKET=${BUCKET}"
+                - BUCKET:
+                       Fn::ImportValue:
+                            !Sub "${ResourcesStackName}-Bucket"
+              mode : "000755"
+              owner: root
+              group: root
+            /home/ubuntu/bin/interrupt_spot.sh:
+              content: |
+                date >> /tmp/interrupt.log
+              mode : "000755"
+              owner: ubuntu
+              group: ubuntu
+            /home/ubuntu/bin/start_training.sh:
+              content: !Sub |
+                #!/bin/bash
+
+                set -xe
+
+                cd ~/deepracer-for-cloud
+                sed -i "s/DR_UPLOAD_S3_BUCKET=not-defined/DR_UPLOAD_S3_BUCKET=${!DEEPRACER_S3_URI}/" ~/deepracer-for-cloud/system.env
+                sed -i "s/DR_LOCAL_S3_BUCKET=bucket/DR_LOCAL_S3_BUCKET=${!DEEPRACER_S3_URI}/" ~/deepracer-for-cloud/system.env
+                source bin/activate.sh
+
+                DR_LOCAL_S3_CUSTOM_FILES_PREFIX=custom_files/${RunName}
+                dr-download-custom-files
+                cp custom_files/*.env .
+                dr-reload
+
+                nohup /bin/bash -lc 'cd ~/deepracer-for-cloud/; source bin/activate.sh; dr-start-training -w' &
+                
+                mkdir -p /tmp/logs/
+                while [ True ]; do
+                    for name in `docker ps -a --format "{{.Names}}"`; do
+                        docker logs ${!name} > /tmp/logs/${!name}.log 2>&1
+                    done
+                    aws s3 cp /tmp/logs/ s3://${!DEEPRACER_S3_URI}/${!DR_LOCAL_S3_MODEL_PREFIX}/logs/ --recursive
+                    rm -rf /tmp/logs/*.*
+                    set +e
+                    dr-upload-model -fw
+                    set -e
+                    sleep 120
+                done
+              mode : "000755"
+              owner: ubuntu
+              group: ubuntu
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Name:
+            !ImportValue
+            'Fn::Sub': '${ResourcesStackName}-InstanceProfile'
+        ImageId: !Sub '{{resolve:ssm:/DeepRacer/Images/${ResourcesStackName}}}'
+        InstanceType: !Ref InstanceType
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: persistent
+            InstanceInterruptionBehavior: stop
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 40
+              DeleteOnTermination: 'true'
+        SecurityGroupIds:
+          - !ImportValue
+            'Fn::Sub': '${ResourcesStackName}-SecurityGroup'
+        TagSpecifications:
+          - ResourceType:
+              instance
+            Tags:
+            - Key: Name
+              Value: !Sub '${AWS::StackName}'
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}
+
+  GetDatetime:
+    Type: Custom::Datetime
+    Properties:
+      ServiceToken: !GetAtt GetDatetimeFunction.Arn
+
+  GetDatetimeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - LambdaFunctionRole
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import json
+          import cfnresponse
+          import datetime
+          def handler(event, context):
+            responseData = {}
+            now = datetime.datetime.now()
+            start_date = now + datetime.timedelta(minutes=${StartMinutes})
+            end_date = now + datetime.timedelta(minutes=${EndMinutes})
+            responseData['Start'] = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+            responseData['End'] = end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+      Handler: index.handler
+      Runtime: python3.7
+      Timeout: 30
+      Role: !GetAtt LambdaFunctionRole.Arn
+
+  SpotInterruptionHandlerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - LambdaFunctionRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          from botocore.exceptions import ClientError
+          import os
+          def handler(event, context):
+              ec2_client = boto3.client("ec2")
+              spot_fleet = ec2_client.describe_spot_fleet_instances(SpotFleetRequestId='${SpotFleet}')
+              instances_created_by_this_stack = [inst["InstanceId"] for inst in spot_fleet["ActiveInstances"]]
+              instance_id = event['detail']['instance-id']
+              instanceAction = event['detail']['instance-action']
+              print("Handling spot instance interruption notification for instance {id}".format(id=instance_id))
+              if instance_id not in instances_created_by_this_stack:
+                  print("Interrupted instance was not created by this stack.")
+                  return
+              ssm_client = boto3.client('ssm')
+              sns_client = boto3.client('sns')
+              try:
+                  response = ssm_client.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName='AWS-RunShellScript',
+                      Parameters={'commands': ['su - ubuntu bash -lc /home/ubuntu/bin/safe_termination.sh']},
+                      CloudWatchOutputConfig={'CloudWatchOutputEnabled': True},
+                      TimeoutSeconds=60)
+                  print(f'Running commands on instance {instance_id}. Command id: {id}')
+              except ssm_client.exceptions.InvalidInstanceId:
+                  print("SSM agent not running.")
+              except ClientError as e:
+                  print(e.response['Error']['Message'])
+              notification_topic = os.environ['INTERRUPTION_NOTIFICATION']
+              sns_client.publish(TopicArn=notification_topic, Message=f'Termination notification instance: {instance_id} stack: ${AWS::StackName}')
+      Runtime: python3.7
+      Environment:
+        Variables:
+          INTERRUPTION_NOTIFICATION: !ImportValue
+                                     'Fn::Sub': '${ResourcesStackName}-InterruptionNotification'
+
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: lambdaExecution-SpotInterruptHandlerPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ssm:*
+            - sns:*
+            - ec2:*
+            Resource: '*'
+
+  LambdaFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SpotInterruptionHandlerFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudWatchEventRule.Arn
+
+  CloudWatchEventRule:
+    Type: AWS::Events::Rule
+    DependsOn:
+    - SpotInterruptionHandlerFunction
+    Properties:
+      Description: Events rule for EC2 Spot Instance Interruption Notices
+      EventPattern:
+        detail-type:
+        - EC2 Spot Instance Interruption Warning
+        source:
+        - aws.ec2
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+            - SpotInterruptionHandlerFunction
+            - Arn
+          Id:
+            Ref: SpotInterruptionHandlerFunction
+
+  TerminationCronExpression:
+    Type: Custom::TerminationCronExpression
+    DependsOn:
+      - SpotFleet
+    Properties:
+      ServiceToken:
+        !ImportValue
+        'Fn::Sub': '${ResourcesStackName}-FutureTimeCronExpressionLambdaArn'
+      ttl: !Ref EndMinutes
+
+  TerminationTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !GetAtt TerminationCronExpression.cron_expression
+      State: ENABLED
+      Targets:
+        - Arn:
+            !ImportValue
+            'Fn::Sub': '${ResourcesStackName}-TerminationLambdaArn'
+          Id: TerminateInstance
+          Input: !Sub '{"spotFleet": "${SpotFleet}", "stack": "${AWS::StackName}"}'
+
+  TerminatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        !ImportValue
+        'Fn::Sub': '${ResourcesStackName}-TerminationLambdaArn'
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TerminationTrigger.Arn

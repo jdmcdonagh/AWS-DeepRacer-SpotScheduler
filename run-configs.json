@@ -1,0 +1,24 @@
+{
+  "test-run-v1": {
+    "description": "For testing",
+    "action-space": "as-example",
+    "hyperparameters": "hp-example",
+    "reward-function": "rf-example",
+    "instance": "g4dn.4xlarge",
+    "clone-checkpoint": "last",
+    "duration": 20,
+    "workers": 3,
+    "round-robin": 0.1
+  },
+  "test-run-v2": {
+    "description": "Another one for testing",
+    "action-space": "as-example",
+    "hyperparameters": "hp-example",
+    "reward-function": "rf-example",
+    "instance": "g4dn.4xlarge",
+    "clone-checkpoint": "last",
+    "duration": 20,
+    "workers": 3,
+    "round-robin": 0.5
+  }
+}

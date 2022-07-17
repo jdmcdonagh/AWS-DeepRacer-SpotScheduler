@@ -1,0 +1,9 @@
+{
+  "TEST-RUN": {
+    "track-name": "2022_march_open",
+    "runs": [
+      "test-run",
+      "test-run"
+    ]
+  }
+}
